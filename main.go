@@ -79,7 +79,7 @@ func (manager *ClientManager) Start() {
 			manager.clients[client] = true
 			manager.mutex.Unlock()
 			log.Printf("Client connected: %s, Total clients: %d", client.id, len(manager.clients))
-			client.send <- []byte(`{"type": "user_assigned", "name": ` + genRandomUsername() + `}`)
+			client.send <- []byte(`{"type": "user_assigned", "name": "` + genRandomUsername() + `"}`)
 
 		case client := <-manager.unregister:
 			manager.mutex.Lock()
