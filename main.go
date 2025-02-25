@@ -29,6 +29,7 @@ const dbConnString = "postgres://postgres:password@localhost:5432/openchamp"
 // ClientManager manages active WebSocket clients
 type ClientManager struct {
 	clients    map[*Client]bool
+	queue      []*Client
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
@@ -216,6 +217,19 @@ func (client *Client) processMessage(data []byte) {
 		client.send <- responseJSON
 	case "query":
 		client.handleDatabaseQuery(msg.Payload)
+	case "queue":
+		client.manager.queue = append(client.manager.queue, client)
+		client.send <- []byte(`{"type": "queued"}`)
+
+	case "dequeue":
+		for i, c := range client.manager.queue {
+			if c == client {
+				client.manager.queue = append(client.manager.queue[:i], client.manager.queue[i+1:]...)
+				break
+			}
+		}
+		client.send <- []byte(`{"type": "dequeued"}`)
+
 	case "broadcast":
 		client.manager.broadcast <- data
 	default:
@@ -330,8 +344,27 @@ func configureServerForHighLoad(srv *http.Server) {
 
 }
 
+// Generate a random username (until login system is implemented)
 func genRandomUsername() string {
 	return "user_" + strconv.Itoa(rand.Intn(1000))
+}
+
+// Check if there are enough players in the queue to start a match
+func checkQueue(manager *ClientManager) {
+	log.Println(strconv.Itoa(len(manager.queue)) + " players in queue")
+	var playersPerMatch = 2
+
+	if len(manager.queue) >= playersPerMatch {
+		log.Println("Starting match with", playersPerMatch, "players")
+		startMatch(manager.queue[:playersPerMatch])
+		manager.queue = manager.queue[playersPerMatch:]
+	}
+}
+
+// Start a match
+func startMatch(players []*Client) {
+	players[0].send <- []byte(`{"type": "match_start"}`)
+	players[1].send <- []byte(`{"type": "match_start"}`)
 }
 
 func main() {
@@ -374,6 +407,17 @@ func main() {
 		log.Printf("Server starting on %s", listenAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Error starting server: %v", err)
+		}
+	}()
+
+	// Start the queue processor in a goroutine
+	go func() {
+		// Check number of players in queue every 5 seconds
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			log.Println("Checking queue...")
+			checkQueue(manager)
 		}
 	}()
 
