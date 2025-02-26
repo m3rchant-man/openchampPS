@@ -79,7 +79,7 @@ func (manager *ClientManager) Start() {
 			manager.clients[client] = true
 			manager.mutex.Unlock()
 			log.Printf("Client connected: %s, Total clients: %d", client.id, len(manager.clients))
-			client.send <- []byte(`{"type": "user_assigned", "name": "` + genRandomUsername() + `"}`)
+			client.send <- []byte(`{"type": "user_assigned", "payload": "` + genRandomUsername() + `"}`)
 
 		case client := <-manager.unregister:
 			manager.mutex.Lock()
@@ -210,8 +210,8 @@ func (client *Client) processMessage(data []byte) {
 	switch msg.Type {
 	case "count":
 		response := map[string]interface{}{
-			"type":  "count_response",
-			"count": len(client.manager.clients),
+			"type":    "player_count",
+			"payload": len(client.manager.clients),
 		}
 		responseJSON, _ := json.Marshal(response)
 		client.send <- responseJSON
@@ -351,7 +351,6 @@ func genRandomUsername() string {
 
 // Check if there are enough players in the queue to start a match
 func checkQueue(manager *ClientManager) {
-	log.Println(strconv.Itoa(len(manager.queue)) + " players in queue")
 	var playersPerMatch = 2
 
 	if len(manager.queue) >= playersPerMatch {
@@ -416,7 +415,6 @@ func main() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			log.Println("Checking queue...")
 			checkQueue(manager)
 		}
 	}()
