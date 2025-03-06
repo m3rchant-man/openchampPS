@@ -38,11 +38,12 @@ type ClientManager struct {
 
 // Client represents a connected WebSocket client
 type Client struct {
-	id      string
-	conn    *websocket.Conn
-	send    chan []byte
-	manager *ClientManager
-	dbPool  *pgxpool.Pool
+	id       string
+	conn     *websocket.Conn
+	send     chan []byte
+	manager  *ClientManager
+	dbPool   *pgxpool.Pool
+	username string
 }
 
 // Message represents a WebSocket message structure
@@ -75,11 +76,12 @@ func (manager *ClientManager) Start() {
 	for {
 		select {
 		case client := <-manager.register:
+			client.username = genRandomUsername()
 			manager.mutex.Lock()
 			manager.clients[client] = true
 			manager.mutex.Unlock()
 			log.Printf("Client connected: %s, Total clients: %d", client.id, len(manager.clients))
-			client.send <- []byte(`{"type": "user_assigned", "payload": "` + genRandomUsername() + `"}`)
+			client.send <- []byte(`{"type": "user_assigned", "payload": "` + client.username + `"}`)
 
 		case client := <-manager.unregister:
 			manager.mutex.Lock()
@@ -208,6 +210,7 @@ func (client *Client) processMessage(data []byte) {
 
 	// Process different message types
 	switch msg.Type {
+	// Lobby Functions
 	case "count":
 		response := map[string]interface{}{
 			"type":    "player_count",
@@ -215,8 +218,15 @@ func (client *Client) processMessage(data []byte) {
 		}
 		responseJSON, _ := json.Marshal(response)
 		client.send <- responseJSON
-	case "query":
-		client.handleDatabaseQuery(msg.Payload)
+	case "global_chat":
+		chatMessage := map[string]interface{}{
+			"type":    "global_chat",
+			"payload": map[string]interface{}{"username": client.username, "message": string(msg.Payload)},
+		}
+		chatMessageJSON, _ := json.Marshal(chatMessage)
+		client.manager.broadcast <- chatMessageJSON
+
+	// Queue Functions
 	case "queue":
 		client.manager.queue = append(client.manager.queue, client)
 		client.send <- []byte(`{"type": "queued"}`)
@@ -230,8 +240,11 @@ func (client *Client) processMessage(data []byte) {
 		}
 		client.send <- []byte(`{"type": "dequeued"}`)
 
-	case "broadcast":
-		client.manager.broadcast <- data
+	// Set Functions
+	case "set_username":
+		client.username = string(msg.Payload)
+		client.send <- []byte(`{"type": "username_set"}`)
+
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
 	}
