@@ -243,7 +243,7 @@ func (client *Client) processMessage(data []byte) {
 	// Set Functions
 	case "set_username":
 		client.username = string(msg.Payload)
-		client.send <- []byte(`{"type": "user_assigned", "payload": "` + client.username + `"}`)
+		client.send <- []byte(`{"type": "user_assigned", "payload": ` + client.username + `}`)
 
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
