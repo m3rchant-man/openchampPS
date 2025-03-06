@@ -1,18 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -51,6 +58,17 @@ type Message struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 }
+
+// Match represents an active game match
+type Match struct {
+	ID        string
+	Port      int
+	Process   *os.Process
+	Players   []*Client
+	StartTime time.Time
+}
+
+var activeMatches = make(map[string]*Match)
 
 // Configure WebSocket upgrader
 var upgrader = websocket.Upgrader{
@@ -364,7 +382,7 @@ func genRandomUsername() string {
 
 // Check if there are enough players in the queue to start a match
 func checkQueue(manager *ClientManager) {
-	var playersPerMatch = 2
+	var playersPerMatch = 1
 
 	if len(manager.queue) >= playersPerMatch {
 		log.Println("Starting match with", playersPerMatch, "players")
@@ -375,10 +393,163 @@ func checkQueue(manager *ClientManager) {
 
 // Start a match
 func startMatch(players []*Client) {
-	players[0].send <- []byte(`{"type": "match_start"}`)
-	players[1].send <- []byte(`{"type": "match_start"}`)
+	// Generate a unique match ID using UUID
+	matchID := uuid.New().String()
+
+	// Find an available port for the game server
+	// Start with a base port and increment if needed
+	basePort := 7000
+	port := basePort
+
+	// Check if port is available, increment if not
+	for {
+		if isPortAvailable(port) {
+			break
+		}
+		port++
+		// Safety check to avoid infinite loop
+		if port > basePort+1000 {
+			log.Printf("Failed to find available port for match %s", matchID)
+			notifyMatchFailure(players)
+			return
+		}
+	}
+
+	// Determine which executable to run based on OS
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("./gameserver/OpenChamp.console.exe",
+			"--port", strconv.Itoa(port),
+			"--id", matchID)
+	} else {
+		cmd = exec.Command("./gameserver/OpenChamp.console.x86_64",
+			"--port", strconv.Itoa(port),
+			"--id", matchID)
+	}
+
+	// Set up pipes for stdout and stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("Error creating stdout pipe for match %s: %v", matchID, err)
+		notifyMatchFailure(players)
+		return
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Printf("Error creating stderr pipe for match %s: %v", matchID, err)
+		notifyMatchFailure(players)
+		return
+	}
+
+	// Start the server process
+	if err := cmd.Start(); err != nil {
+		log.Printf("Error starting game server for match %s: %v", matchID, err)
+		notifyMatchFailure(players)
+		return
+	}
+
+	// Log server output
+	go logServerOutput(stdout, stderr, matchID)
+
+	// Store the process for later cleanup
+	activeMatches[matchID] = &Match{
+		ID:        matchID,
+		Port:      port,
+		Process:   cmd.Process,
+		Players:   players,
+		StartTime: time.Now(),
+	}
+
+	// Notify players of match start with server details
+	matchInfo := map[string]interface{}{
+		"type": "match_start",
+		"payload": map[string]interface{}{
+			"matchID": matchID,
+			"port":    port,
+		},
+	}
+	matchInfoJSON, _ := json.Marshal(matchInfo)
+
+	for _, player := range players {
+		player.send <- matchInfoJSON
+	}
+
+	log.Printf("Started match %s on port %d with %d players", matchID, port, len(players))
+
+	// Monitor the process for termination
+	go monitorMatchProcess(cmd, matchID)
 }
 
+// Check if a port is available
+func isPortAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	ln.Close()
+	return true
+}
+
+// Log server output
+func logServerOutput(stdout, stderr io.ReadCloser, matchID string) {
+	// Read and log stdout
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			log.Printf("Match %s stdout: %s", matchID, scanner.Text())
+		}
+	}()
+
+	// Read and log stderr
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			log.Printf("Match %s stderr: %s", matchID, scanner.Text())
+		}
+	}()
+}
+
+// Monitor match process
+func monitorMatchProcess(cmd *exec.Cmd, matchID string) {
+	err := cmd.Wait()
+
+	// Process terminated
+	log.Printf("Match %s terminated: %v", matchID, err)
+
+	// Clean up the match data
+	match, exists := activeMatches[matchID]
+	if exists {
+		// Notify players if they're still connected
+		matchEndJSON, _ := json.Marshal(map[string]interface{}{
+			"type":    "match_end",
+			"matchID": matchID,
+		})
+
+		for _, player := range match.Players {
+			select {
+			case player.send <- matchEndJSON:
+			default:
+				// Player might be disconnected already
+			}
+		}
+
+		// Remove from active matches
+		delete(activeMatches, matchID)
+	}
+}
+
+// Notify players of match failure
+func notifyMatchFailure(players []*Client) {
+	failureJSON, _ := json.Marshal(map[string]interface{}{
+		"type":  "match_error",
+		"error": "Failed to start match server",
+	})
+
+	for _, player := range players {
+		player.send <- failureJSON
+	}
+}
 func main() {
 	// Initialize the client manager
 	manager := NewClientManager()
