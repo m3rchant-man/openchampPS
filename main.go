@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -30,8 +32,76 @@ const (
 	readBufferSize  = 1024
 	writeBufferSize = 1024
 	maxConnections  = 1000000 // 1 million connections
+	baseGamePort    = 7000    // Starting port for game servers
+	maxGamePort     = 8000    // Maximum port for game servers
 )
+
 const dbConnString = "postgres://postgres:password@localhost:5432/openchamp"
+
+// PortManager manages game server port allocation
+type PortManager struct {
+	mutex       sync.Mutex
+	usedPorts   map[int]bool
+	basePort    int
+	maxPort     int
+	currentPort int
+}
+
+// NewPortManager creates a new port manager
+func NewPortManager(basePort, maxPort int) *PortManager {
+	return &PortManager{
+		usedPorts:   make(map[int]bool),
+		basePort:    basePort,
+		maxPort:     maxPort,
+		currentPort: basePort,
+	}
+}
+
+// GetPort allocates a new port
+func (pm *PortManager) GetPort() (int, error) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+
+	// Try to find an available port starting from currentPort
+	startPort := pm.currentPort
+	for {
+		// Check if port is already marked as used
+		if !pm.usedPorts[pm.currentPort] {
+			// Verify port is actually available at OS level
+			if isPortAvailable(pm.currentPort) {
+				pm.usedPorts[pm.currentPort] = true
+				allocatedPort := pm.currentPort
+
+				// Increment for next allocation
+				pm.currentPort++
+				if pm.currentPort > pm.maxPort {
+					pm.currentPort = pm.basePort
+				}
+
+				return allocatedPort, nil
+			}
+		}
+
+		// Move to next port
+		pm.currentPort++
+		if pm.currentPort > pm.maxPort {
+			pm.currentPort = pm.basePort
+		}
+
+		// If we've checked all ports and found none, return error
+		if pm.currentPort == startPort {
+			return 0, fmt.Errorf("no available ports between %d and %d", pm.basePort, pm.maxPort)
+		}
+	}
+}
+
+// ReleasePort marks a port as no longer in use
+func (pm *PortManager) ReleasePort(port int) {
+	pm.mutex.Lock()
+	defer pm.mutex.Unlock()
+	delete(pm.usedPorts, port)
+	log.Printf("Port %d released", port)
+}
 
 // ClientManager manages active WebSocket clients
 type ClientManager struct {
@@ -51,6 +121,10 @@ type Client struct {
 	manager  *ClientManager
 	dbPool   *pgxpool.Pool
 	username string
+
+	// Authentication fields
+	authenticated bool
+	authToken     string
 }
 
 // Message represents a WebSocket message structure
@@ -66,9 +140,14 @@ type Match struct {
 	Process   *os.Process
 	Players   []*Client
 	StartTime time.Time
+	Cmd       *exec.Cmd // Store the command for proper process management
 }
 
-var activeMatches = make(map[string]*Match)
+var (
+	activeMatches = make(map[string]*Match)
+	matchesMutex  sync.RWMutex
+	portManager   *PortManager
+)
 
 // Configure WebSocket upgrader
 var upgrader = websocket.Upgrader{
@@ -94,12 +173,17 @@ func (manager *ClientManager) Start() {
 	for {
 		select {
 		case client := <-manager.register:
+			// Initially assign a temporary guest username
 			client.username = genRandomUsername()
+			client.authenticated = false
+
 			manager.mutex.Lock()
 			manager.clients[client] = true
 			manager.mutex.Unlock()
 			log.Printf("Client connected: %s, Total clients: %d", client.id, len(manager.clients))
-			client.send <- []byte(`{"type": "user_assigned", "payload": "` + client.username + `"}`)
+
+			// Send a connection acknowledgment with temporary username
+			client.send <- []byte(`{"type": "connection_established", "payload": {"temp_username": "` + client.username + `", "auth_required": true}}`)
 
 		case client := <-manager.unregister:
 			manager.mutex.Lock()
@@ -226,7 +310,33 @@ func (client *Client) processMessage(data []byte) {
 		return
 	}
 
-	// Process different message types
+	// Authentication and registration messages are always allowed
+	if msg.Type == "login" || msg.Type == "token_auth" || msg.Type == "register" {
+		switch msg.Type {
+		case "login", "token_auth":
+			client.handleAuthentication(msg)
+		case "register":
+			client.handleRegistration(msg)
+		}
+		return
+	}
+
+	// For other message types, check if authenticated
+	if !client.authenticated {
+		// Reject non-authenticated requests
+		response := map[string]interface{}{
+			"type": "error",
+			"payload": map[string]interface{}{
+				"message": "Authentication required",
+				"code":    "AUTH_REQUIRED",
+			},
+		}
+		responseJSON, _ := json.Marshal(response)
+		client.send <- responseJSON
+		return
+	}
+
+	// Process different message types for authenticated users
 	switch msg.Type {
 	// Lobby Functions
 	case "count":
@@ -236,6 +346,7 @@ func (client *Client) processMessage(data []byte) {
 		}
 		responseJSON, _ := json.Marshal(response)
 		client.send <- responseJSON
+
 	case "global_chat":
 		chatMessage := map[string]interface{}{
 			"type":    "global_chat",
@@ -246,26 +357,403 @@ func (client *Client) processMessage(data []byte) {
 
 	// Queue Functions
 	case "queue":
+		client.manager.mutex.Lock()
 		client.manager.queue = append(client.manager.queue, client)
+		client.manager.mutex.Unlock()
 		client.send <- []byte(`{"type": "queued"}`)
 
 	case "dequeue":
+		client.manager.mutex.Lock()
 		for i, c := range client.manager.queue {
 			if c == client {
 				client.manager.queue = append(client.manager.queue[:i], client.manager.queue[i+1:]...)
 				break
 			}
 		}
+		client.manager.mutex.Unlock()
 		client.send <- []byte(`{"type": "dequeued"}`)
 
 	// Set Functions
 	case "set_username":
-		client.username = string(msg.Payload)
-		client.send <- []byte(`{"type": "user_assigned", "payload": ` + client.username + `}`)
+		// Authenticated users can only change their display name, not their actual username
+		var newDisplayName string
+		if err := json.Unmarshal(msg.Payload, &newDisplayName); err == nil {
+			client.send <- []byte(`{"type": "display_name_updated", "payload": "` + newDisplayName + `"}`)
+		}
+
+	case "logout":
+		// Handle logout
+		client.authenticated = false
+		client.authToken = ""
+		client.username = genRandomUsername()
+		client.send <- []byte(`{"type": "logged_out"}`)
 
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
 	}
+}
+
+// Handle authentication requests
+func (client *Client) handleAuthentication(msg Message) {
+	switch msg.Type {
+	case "login":
+		// Username/password authentication
+		var credentials struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+
+		if err := json.Unmarshal(msg.Payload, &credentials); err != nil {
+			log.Printf("Error parsing login credentials: %v", err)
+			client.sendAuthError("Invalid login format")
+			return
+		}
+
+		// Validate credentials against database
+		authenticated, token, err := client.validateCredentials(credentials.Username, credentials.Password)
+		if err != nil || !authenticated {
+			client.sendAuthError("Invalid username or password")
+			return
+		}
+
+		// Authentication successful
+		client.completeAuthentication(credentials.Username, token)
+
+	case "token_auth":
+		// Token-based authentication
+		var tokenAuth struct {
+			Token string `json:"token"`
+		}
+
+		if err := json.Unmarshal(msg.Payload, &tokenAuth); err != nil {
+			log.Printf("Error parsing token auth: %v", err)
+			client.sendAuthError("Invalid token format")
+			return
+		}
+
+		// Extract client's real IP address from connection
+		clientIP := client.getClientIP()
+
+		// Validate token against database
+		username, valid, err := client.validateToken(tokenAuth.Token, clientIP)
+		if err != nil || !valid {
+			client.sendAuthError("Invalid or expired token")
+			return
+		}
+
+		// Authentication successful
+		client.completeAuthentication(username, tokenAuth.Token)
+	}
+}
+
+// Send authentication error response
+func (client *Client) sendAuthError(message string) {
+	response := map[string]interface{}{
+		"type": "auth_error",
+		"payload": map[string]interface{}{
+			"message": message,
+		},
+	}
+	responseJSON, _ := json.Marshal(response)
+	client.send <- responseJSON
+}
+
+// Handle user registration via WebSocket
+func (client *Client) handleRegistration(msg Message) {
+	var registration struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &registration); err != nil {
+		log.Printf("Error parsing registration data: %v", err)
+		client.sendRegistrationError("Invalid registration format")
+		return
+	}
+
+	// Validate input
+	if len(registration.Username) < 3 {
+		client.sendRegistrationError("Username must be at least 3 characters")
+		return
+	}
+
+	if len(registration.Password) < 6 {
+		client.sendRegistrationError("Password must be at least 6 characters")
+		return
+	}
+
+	// Check if username already exists
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var exists bool
+	err := client.dbPool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)",
+		registration.Username).Scan(&exists)
+
+	if err != nil {
+		log.Printf("Database error during registration: %v", err)
+		client.sendRegistrationError("Registration failed due to a server error")
+		return
+	}
+
+	if exists {
+		client.sendRegistrationError("Username already exists")
+		return
+	}
+
+	// Check if email already exists (if provided)
+	if registration.Email != "" {
+		err = client.dbPool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)",
+			registration.Email).Scan(&exists)
+
+		if err != nil {
+			log.Printf("Database error during registration: %v", err)
+			client.sendRegistrationError("Registration failed due to a server error")
+			return
+		}
+
+		if exists {
+			client.sendRegistrationError("Email already registered")
+			return
+		}
+	}
+
+	// TODO: Hash the password in production
+	passwordHash := registration.Password // Placeholder for demo
+
+	// Insert user into database
+	_, err = client.dbPool.Exec(ctx,
+		"INSERT INTO users (username, password_hash, email) VALUES ($1, $2, $3)",
+		registration.Username, passwordHash, registration.Email)
+
+	if err != nil {
+		log.Printf("Error inserting new user: %v", err)
+		client.sendRegistrationError("Registration failed due to a server error")
+		return
+	}
+
+	// Generate token for automatic login
+	token := uuid.New().String()
+
+	// Get the user ID for the token
+	var userID int
+	err = client.dbPool.QueryRow(ctx,
+		"SELECT id FROM users WHERE username = $1",
+		registration.Username).Scan(&userID)
+
+	if err != nil {
+		log.Printf("Error retrieving new user ID: %v", err)
+		// Registration was successful, but auto-login failed
+		client.sendRegistrationSuccess(false, "", "")
+		return
+	}
+
+	// Get client's real IP
+	clientIP := client.getClientIP()
+
+	// Store token with IP
+	_, err = client.dbPool.Exec(ctx,
+		"INSERT INTO auth_tokens (user_id, token, ip_address, created_at, expires_at) VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '7 days')",
+		userID, token, clientIP)
+
+	if err != nil {
+		log.Printf("Error creating token for new user: %v", err)
+		// Registration was successful, but auto-login failed
+		client.sendRegistrationSuccess(false, "", "")
+		return
+	}
+
+	// Registration and auto-login successful
+	client.username = registration.Username
+	client.authenticated = true
+	client.authToken = token
+
+	// Send success response with auto-login token
+	client.sendRegistrationSuccess(true, registration.Username, token)
+
+	log.Printf("New user registered and authenticated: %s", registration.Username)
+}
+
+// Send registration error response
+func (client *Client) sendRegistrationError(message string) {
+	response := map[string]interface{}{
+		"type": "register_error",
+		"payload": map[string]interface{}{
+			"message": message,
+		},
+	}
+	responseJSON, _ := json.Marshal(response)
+	client.send <- responseJSON
+}
+
+// Send registration success response
+func (client *Client) sendRegistrationSuccess(autoLogin bool, username, token string) {
+	payload := map[string]interface{}{
+		"success":   true,
+		"message":   "Registration successful",
+		"autoLogin": autoLogin,
+	}
+
+	// Include login info if auto-login succeeded
+	if autoLogin {
+		payload["username"] = username
+		payload["token"] = token
+	}
+
+	response := map[string]interface{}{
+		"type":    "register_success",
+		"payload": payload,
+	}
+
+	responseJSON, _ := json.Marshal(response)
+	client.send <- responseJSON
+}
+
+// Complete the authentication process
+func (client *Client) completeAuthentication(username string, token string) {
+	client.authenticated = true
+	client.username = username
+	client.authToken = token
+
+	// Send successful authentication response
+	response := map[string]interface{}{
+		"type": "auth_success",
+		"payload": map[string]interface{}{
+			"username": username,
+			"token":    token,
+		},
+	}
+	responseJSON, _ := json.Marshal(response)
+	client.send <- responseJSON
+
+	log.Printf("Client authenticated: %s as %s", client.id, username)
+}
+
+// Validate username and password against database
+func (client *Client) validateCredentials(username, password string) (bool, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		userID       int
+		passwordHash string
+	)
+
+	// Query the database for user credentials
+	// Note: In production, you should use proper password hashing like bcrypt
+	err := client.dbPool.QueryRow(ctx,
+		"SELECT id, password_hash FROM users WHERE username = $1",
+		username).Scan(&userID, &passwordHash)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, "", nil // User not found
+		}
+		return false, "", err // Database error
+	}
+
+	// TODO: Use proper password verification (bcrypt, etc.)
+	// This is just a placeholder - in production use secure comparison
+	if passwordHash != password {
+		return false, "", nil // Password doesn't match
+	}
+
+	// Generate a new auth token
+	token := uuid.New().String()
+
+	// Get client's real IP
+	clientIP := client.getClientIP()
+
+	// Store the token in the database with IP
+	_, err = client.dbPool.Exec(ctx,
+		"INSERT INTO auth_tokens (user_id, token, ip_address, created_at, expires_at) VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '7 days')",
+		userID, token, clientIP)
+
+	if err != nil {
+		return false, "", err
+	}
+
+	return true, token, nil
+}
+
+// Get the client's real IP address
+func (client *Client) getClientIP() string {
+	// Extract IP from WebSocket connection
+	// First, get the remote address from the connection
+	remoteAddr := client.conn.RemoteAddr().String()
+
+	// Extract just the IP part (remove port)
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		// Fallback to full address if we can't split it
+		return remoteAddr
+	}
+
+	return ip
+}
+
+// Validate token and IP against database
+func (client *Client) validateToken(token, clientIP string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		username string
+		storedIP sql.NullString
+		tokenID  int
+	)
+
+	// Query the database to validate the token
+	err := client.dbPool.QueryRow(ctx,
+		`SELECT t.id, u.username, t.ip_address
+		FROM auth_tokens t
+		JOIN users u ON t.user_id = u.id
+		WHERE t.token = $1 
+		AND t.expires_at > NOW()`,
+		token).Scan(&tokenID, &username, &storedIP)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", false, nil // Token not found or expired
+		}
+		return "", false, err // Database error
+	}
+
+	// Check IP restrictions if a previous IP is stored
+	if storedIP.Valid && storedIP.String != "" {
+		// If this is a different IP than previously used with this token,
+		// we can either reject it or implement additional security checks
+		if storedIP.String != clientIP {
+			log.Printf("Warning: Token used from new IP. Original: %s, Current: %s",
+				storedIP.String, clientIP)
+
+			// Depending on security requirements, you might want to:
+			// 1. Reject the attempt (uncomment the next line)
+			// return "", false, nil
+
+			// 2. Allow it but track the new IP
+			// 3. Require additional verification
+			// 4. Rate limit new IP logins
+		}
+	}
+
+	// Update the token's last_used_at timestamp and IP
+	_, err = client.dbPool.Exec(ctx,
+		`UPDATE auth_tokens 
+		SET last_used_at = NOW(), 
+		    ip_address = $1
+		WHERE id = $2`,
+		clientIP, tokenID)
+
+	if err != nil {
+		log.Printf("Error updating token usage: %v", err)
+		// Non-critical error, we can continue
+	}
+
+	return username, true, nil
 }
 
 // Handle database queries
@@ -359,20 +847,18 @@ func initDBPool() (*pgxpool.Pool, error) {
 
 // Configure server for high throughput (Uncomment when move to linux)
 func configureServerForHighLoad(srv *http.Server) {
-
 	// Increase the maximum number of open files on linux
-	// if runtime.GOOS == "linux" {
-	// 	var rLimit syscall.Rlimit
-	// 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-	// 		log.Println("Error getting rlimit:", err)
-	// 	} else {
-	// 		rLimit.Cur = rLimit.Max
-	// 		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-	// 			log.Println("Error setting rlimit:", err)
-	// 		}
-	// 	}
-	// }
-
+	if runtime.GOOS == "linux" {
+		var rLimit syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+			log.Println("Error getting rlimit:", err)
+		} else {
+			rLimit.Cur = rLimit.Max
+			if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+				log.Println("Error setting rlimit:", err)
+			}
+		}
+	}
 }
 
 // Generate a random username (until login system is implemented)
@@ -384,10 +870,18 @@ func genRandomUsername() string {
 func checkQueue(manager *ClientManager) {
 	var playersPerMatch = 1
 
-	if len(manager.queue) >= playersPerMatch {
-		log.Println("Starting match with", playersPerMatch, "players")
-		startMatch(manager.queue[:playersPerMatch])
+	manager.mutex.Lock()
+	queueLength := len(manager.queue)
+	manager.mutex.Unlock()
+
+	if queueLength >= playersPerMatch {
+		manager.mutex.Lock()
+		players := manager.queue[:playersPerMatch]
 		manager.queue = manager.queue[playersPerMatch:]
+		manager.mutex.Unlock()
+
+		log.Println("Starting match with", playersPerMatch, "players")
+		go startMatch(players) // Run in goroutine to not block queue processing
 	}
 }
 
@@ -396,23 +890,12 @@ func startMatch(players []*Client) {
 	// Generate a unique match ID using UUID
 	matchID := uuid.New().String()
 
-	// Find an available port for the game server
-	// Start with a base port and increment if needed
-	basePort := 7000
-	port := basePort
-
-	// Check if port is available, increment if not
-	for {
-		if isPortAvailable(port) {
-			break
-		}
-		port++
-		// Safety check to avoid infinite loop
-		if port > basePort+1000 {
-			log.Printf("Failed to find available port for match %s", matchID)
-			notifyMatchFailure(players)
-			return
-		}
+	// Get a port from the port manager
+	port, err := portManager.GetPort()
+	if err != nil {
+		log.Printf("Failed to allocate port for match %s: %v", matchID, err)
+		notifyMatchFailure(players)
+		return
 	}
 
 	// Determine which executable to run based on OS
@@ -431,6 +914,7 @@ func startMatch(players []*Client) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("Error creating stdout pipe for match %s: %v", matchID, err)
+		portManager.ReleasePort(port)
 		notifyMatchFailure(players)
 		return
 	}
@@ -438,6 +922,7 @@ func startMatch(players []*Client) {
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		log.Printf("Error creating stderr pipe for match %s: %v", matchID, err)
+		portManager.ReleasePort(port)
 		notifyMatchFailure(players)
 		return
 	}
@@ -445,6 +930,7 @@ func startMatch(players []*Client) {
 	// Start the server process
 	if err := cmd.Start(); err != nil {
 		log.Printf("Error starting game server for match %s: %v", matchID, err)
+		portManager.ReleasePort(port)
 		notifyMatchFailure(players)
 		return
 	}
@@ -452,14 +938,19 @@ func startMatch(players []*Client) {
 	// Log server output
 	go logServerOutput(stdout, stderr, matchID)
 
-	// Store the process for later cleanup
-	activeMatches[matchID] = &Match{
+	// Store the match data
+	match := &Match{
 		ID:        matchID,
 		Port:      port,
 		Process:   cmd.Process,
 		Players:   players,
 		StartTime: time.Now(),
+		Cmd:       cmd,
 	}
+
+	matchesMutex.Lock()
+	activeMatches[matchID] = match
+	matchesMutex.Unlock()
 
 	// Notify players of match start with server details
 	matchInfo := map[string]interface{}{
@@ -478,7 +969,7 @@ func startMatch(players []*Client) {
 	log.Printf("Started match %s on port %d with %d players", matchID, port, len(players))
 
 	// Monitor the process for termination
-	go monitorMatchProcess(cmd, matchID)
+	go monitorMatchProcess(cmd, matchID, port)
 }
 
 // Check if a port is available
@@ -511,14 +1002,20 @@ func logServerOutput(stdout, stderr io.ReadCloser, matchID string) {
 }
 
 // Monitor match process
-func monitorMatchProcess(cmd *exec.Cmd, matchID string) {
+func monitorMatchProcess(cmd *exec.Cmd, matchID string, port int) {
 	err := cmd.Wait()
 
 	// Process terminated
 	log.Printf("Match %s terminated: %v", matchID, err)
 
+	// Release the port back to the port manager
+	portManager.ReleasePort(port)
+
 	// Clean up the match data
+	matchesMutex.Lock()
 	match, exists := activeMatches[matchID]
+	matchesMutex.Unlock()
+
 	if exists {
 		// Notify players if they're still connected
 		matchEndJSON, _ := json.Marshal(map[string]interface{}{
@@ -535,7 +1032,9 @@ func monitorMatchProcess(cmd *exec.Cmd, matchID string) {
 		}
 
 		// Remove from active matches
+		matchesMutex.Lock()
 		delete(activeMatches, matchID)
+		matchesMutex.Unlock()
 	}
 }
 
@@ -550,7 +1049,61 @@ func notifyMatchFailure(players []*Client) {
 		player.send <- failureJSON
 	}
 }
+
+// Create necessary database tables if they don't exist
+func setupDatabase(dbPool *pgxpool.Pool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create users table
+	_, err := dbPool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS users (
+			id SERIAL PRIMARY KEY,
+			username VARCHAR(50) UNIQUE NOT NULL,
+			password_hash VARCHAR(255) NOT NULL,
+			email VARCHAR(255) UNIQUE,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			last_login TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create users table: %w", err)
+	}
+
+	// Create auth_tokens table
+	_, err = dbPool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS auth_tokens (
+			id SERIAL PRIMARY KEY,
+			user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+			token VARCHAR(255) UNIQUE NOT NULL,
+			ip_address VARCHAR(50),
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			expires_at TIMESTAMP NOT NULL,
+			last_used_at TIMESTAMP,
+			is_revoked BOOLEAN NOT NULL DEFAULT FALSE
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create auth_tokens table: %w", err)
+	}
+
+	// Create indexes for faster lookups
+	_, err = dbPool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_auth_tokens_token ON auth_tokens(token);
+		CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_id ON auth_tokens(user_id);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create indexes: %w", err)
+	}
+
+	log.Println("Database tables initialized successfully")
+	return nil
+}
+
 func main() {
+	// Set up the port manager
+	portManager = NewPortManager(baseGamePort, maxGamePort)
+
 	// Initialize the client manager
 	manager := NewClientManager()
 	go manager.Start()
@@ -561,6 +1114,11 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer dbPool.Close()
+
+	// Set up database tables
+	if err := setupDatabase(dbPool); err != nil {
+		log.Printf("Warning: Database setup issue: %v", err)
+	}
 
 	// Create router and handlers
 	mux := http.NewServeMux()
@@ -574,6 +1132,52 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
+	})
+
+	// User registration endpoint
+	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var registration struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Email    string `json:"email"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// Validate input
+		if len(registration.Username) < 3 || len(registration.Password) < 6 {
+			http.Error(w, "Username must be at least 3 characters and password at least 6 characters", http.StatusBadRequest)
+			return
+		}
+
+		// TODO: Hash the password with bcrypt in production
+		passwordHash := registration.Password // Placeholder for demo
+
+		// Insert user into database
+		ctx := r.Context()
+		_, err := dbPool.Exec(ctx,
+			"INSERT INTO users (username, password_hash, email) VALUES ($1, $2, $3)",
+			registration.Username, passwordHash, registration.Email)
+
+		if err != nil {
+			log.Printf("Error registering user: %v", err)
+			http.Error(w, "Username or email already exists", http.StatusConflict)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "success",
+			"message": "User registered successfully",
+		})
 	})
 
 	// Create server
@@ -615,6 +1219,18 @@ func main() {
 	// Create shutdown context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Stop all running game servers
+	matchesMutex.Lock()
+	for id, match := range activeMatches {
+		log.Printf("Stopping game server for match %s...", id)
+		if match.Process != nil {
+			if err := match.Process.Kill(); err != nil {
+				log.Printf("Error killing process for match %s: %v", id, err)
+			}
+		}
+	}
+	matchesMutex.Unlock()
 
 	// Shutdown the server
 	if err := server.Shutdown(ctx); err != nil {
