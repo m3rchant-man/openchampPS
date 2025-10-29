@@ -1,1 +1,16 @@
-/gameserver/
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+openchamp-server
+
+# MacOS files
+.DS_Store
+
+# Environment files
+.env
+
+# Editor directories
+.vscode/
