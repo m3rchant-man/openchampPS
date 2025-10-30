@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -20,6 +21,13 @@ const (
 	BaseGamePort    = 7000
 	MaxGamePort     = 8000
 )
+
+var ValidateEmails = func() bool {
+	v := os.Getenv("OC_EMAIL_VALIDATION")
+	if v == "" { return false }
+	lv := strings.ToLower(v)
+	return lv == "true"
+}()
 
 // Database connection string construction
 var dbConnString = func() string {
