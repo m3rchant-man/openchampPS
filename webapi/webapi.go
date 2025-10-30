@@ -7,6 +7,7 @@ import (
 	"openchamp/server/wsm"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func NewServer(manager *wsm.ClientManager, dbPool *pgxpool.Pool, listenAddr string) *http.Server {
@@ -46,12 +47,18 @@ func NewServer(manager *wsm.ClientManager, dbPool *pgxpool.Pool, listenAddr stri
 			return
 		}
 
-		// TODO: Hash the password with bcrypt in production
-		passwordHash := registration.Password // Placeholder for demo
+		// Hash the password with bcrypt before storing
+		hashed, err := bcrypt.GenerateFromPassword([]byte(registration.Password), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("Error hashing password: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		passwordHash := string(hashed)
 
 		// Insert user into database
 		ctx := r.Context()
-		_, err := dbPool.Exec(ctx,
+		_, err = dbPool.Exec(ctx,
 			"INSERT INTO users (username, password_hash, email) VALUES ($1, $2, $3)",
 			registration.Username, passwordHash, registration.Email)
 
@@ -74,6 +81,7 @@ func NewServer(manager *wsm.ClientManager, dbPool *pgxpool.Pool, listenAddr stri
 
 	return server
 }
+
 // StartServer starts the provided http.Server
 func StartServer(server *http.Server) {
 	log.Printf("Server starting on %s", server.Addr)
