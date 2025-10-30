@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"openchamp/server/portmanager"
+	"openchamp/server/config"
 )
 
 type ClientManager struct {
@@ -423,25 +424,24 @@ func (client *Client) handleRegistration(msg Message) {
 		return
 	}
 
-/* === EMAIL CHECKING (TURN ON IN PROD) === */
-	// Check if email already exists (if provided)
+	/* === EMAIL CHECKING (controlled by env) === */
+	// Check if email already exists (if provided) when enabled via config.ValidateEmails
+	if config.ValidateEmails && registration.Email != "" {
+		err = client.dbPool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)",
+			registration.Email).Scan(&exists)
 
-	// if registration.Email != "" {
-	// 	err = client.dbPool.QueryRow(ctx,
-	// 		"SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)",
-	// 		registration.Email).Scan(&exists)
+		if err != nil {
+			log.Printf("Database error during registration: %v", err)
+			client.sendRegistrationError("Registration failed due to a server error")
+			return
+		}
 
-	// 	if err != nil {
-	// 		log.Printf("Database error during registration: %v", err)
-	// 		client.sendRegistrationError("Registration failed due to a server error")
-	// 		return
-	// 	}
-
-	// 	if exists {
-	// 		client.sendRegistrationError("Email already registered")
-	// 		return
-	// 	}
-	// }
+		if exists {
+			client.sendRegistrationError("Email already registered")
+			return
+		}
+	}
 
 	hashedPw, err := bcrypt.GenerateFromPassword([]byte(registration.Password), bcrypt.DefaultCost)
 	if err != nil {
