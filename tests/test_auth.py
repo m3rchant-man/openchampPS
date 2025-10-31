@@ -2,6 +2,9 @@ import pytest
 import requests
 import uuid
 import os
+import asyncio
+import websockets
+import json
 
 BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8080")
 WS_URL = f"ws://{BASE_URL.split('//')[1]}/ws" if BASE_URL.startswith("http") else f"ws://{BASE_URL}/ws"
@@ -43,3 +46,38 @@ def test_user_registration_failure_duplicate_user(unique_user_payload):
     response2 = requests.post(f"{BASE_URL}/register", json=unique_user_payload)
     assert response2.status_code == 409  # Conflict
     assert "Username or email already exists" in response2.text
+
+
+@pytest.mark.asyncio
+async def test_user_registration_and_authentication(unique_user_payload):
+    """
+    Tests that a user can be created and then authenticated via WebSocket.
+    """
+    # Register user via WebSocket to get a token
+    async with websockets.connect(WS_URL) as websocket:
+        register_payload = {
+            "type": "register",
+            "payload": unique_user_payload
+        }
+        await websocket.send(json.dumps(register_payload))
+        
+        response_str = await websocket.recv()
+        response_data = json.loads(response_str)
+        
+        assert response_data.get("type") == "register_success"
+        token = response_data.get("payload", {}).get("token")
+        assert token is not None
+
+    # Authenticate with the token in a new connection
+    async with websockets.connect(WS_URL) as websocket:
+        token_auth_payload = {
+            "type": "token_auth",
+            "payload": {"token": token},
+        }
+        await websocket.send(json.dumps(token_auth_payload))
+
+        response_str = await websocket.recv()
+        response_data = json.loads(response_str)
+
+        assert response_data["type"] == "auth_success"
+        assert "token" in response_data["payload"]
