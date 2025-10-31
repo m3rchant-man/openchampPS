@@ -1,4 +1,4 @@
-#!/bin/bash
+    #!/bin/bash
 set -eo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -43,4 +43,4 @@ fi
 source "$VENV_PATH/bin/activate"
 
 echo "Running integration tests..."
-pytest "$PROJECT_ROOT/tests/" "$@"
+pytest -v "$PROJECT_ROOT/tests/" "$@"
