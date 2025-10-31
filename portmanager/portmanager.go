@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ type QueuedPlayer struct {
 /* === Global Vars === */
 var (
 	Manager *PortManager
-	once        sync.Once
+	once    sync.Once
 )
 
 // NewPortManager creates a new port manager
@@ -130,7 +131,7 @@ func (pm *PortManager) StartQueueProcessor() {
 	log.Println("Queue processor started")
 	for {
 		time.Sleep(1 * time.Second)
-		
+
 		pm.mutex.Lock()
 		queueSize := len(pm.queue)
 		if queueSize >= 2 {
@@ -153,12 +154,43 @@ func (pm *PortManager) startMatch(players []*QueuedPlayer) {
 		return
 	}
 
-	log.Printf("Starting match for players %s and %s on port %d", 
+	log.Printf("Starting match for players %s and %s on port %d",
 		players[0].Username, players[1].Username, port)
 
+	// Check env var to create a dummy game without a real container
+	if os.Getenv("DUMMY_GAME") == "true" {
+		log.Println("DUMMY_GAME env var is set, creating a dummy game.")
+
+		// Generate a fake container ID
+		dummyContainerID := fmt.Sprintf("dummy-game-%s-%s",
+			strings.Split(players[0].ID, ":")[0],
+			strings.Split(players[1].ID, ":")[0])
+
+		// Notify players about the match
+		for _, player := range players {
+			if client, ok := player.Client.(interface{ Send() chan []byte }); ok {
+				matchInfo := map[string]interface{}{
+					"type": "match_found",
+					"payload": map[string]interface{}{
+						"port":        port,
+						"players":     []string{players[0].Username, players[1].Username},
+						"containerID": dummyContainerID,
+					},
+				}
+				matchInfoJSON, _ := json.Marshal(matchInfo)
+				client.Send() <- matchInfoJSON
+			}
+		}
+
+		// "Monitor" the fake container. This will fail immediately and release the port,
+		// simulating a game that starts and quickly ends.
+		go pm.monitorContainer(dummyContainerID, port)
+		return
+	}
+
 	// Generate a unique container name using player IDs
-	containerName := fmt.Sprintf("game-server-%s-%s", 
-		strings.Split(players[0].ID, ":")[0], 
+	containerName := fmt.Sprintf("game-server-%s-%s",
+		strings.Split(players[0].ID, ":")[0],
 		strings.Split(players[1].ID, ":")[0])
 
 	// Start Podman container for match
@@ -218,7 +250,7 @@ func (pm *PortManager) startMatch(players []*QueuedPlayer) {
 
 	// Start monitoring the container
 	go pm.monitorContainer(containerID, port)
-}// Check if a port is available at the OS level
+} // Check if a port is available at the OS level
 func isPortAvailable(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -227,6 +259,7 @@ func isPortAvailable(port int) bool {
 	ln.Close()
 	return true
 }
+
 // InitPortManager initializes the global port manager instance (intentional singleton)
 func InitPortManager(basePort, maxPort int) {
 	once.Do(func() {
@@ -247,6 +280,7 @@ func ReleasePort(port int) {
 		Manager.ReleasePort(port)
 	}
 }
+
 // Watch a game container and clean up when it exits
 func (pm *PortManager) monitorContainer(containerID string, port int) {
 	// Wait for container exit
