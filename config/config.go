@@ -24,13 +24,15 @@ const (
 
 var ValidateEmails = func() bool {
 	v := os.Getenv("OC_EMAIL_VALIDATION")
-	if v == "" { return false }
+	if v == "" {
+		return false
+	}
 	lv := strings.ToLower(v)
 	return lv == "true"
 }()
 
 // Database connection string construction
-var dbConnString = func() string {
+func dbConnString() string {
 	if v := os.Getenv("DB_CONN"); v != "" {
 		return v
 	}
@@ -56,11 +58,13 @@ var dbConnString = func() string {
 	}
 
 	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s", user, pass, host, port, db)
-}()
+}
 
 func InitDBPool() (*pgxpool.Pool, error) {
-	cfg, err := pgxpool.ParseConfig(dbConnString)
+	cfg, err := pgxpool.ParseConfig(dbConnString())
+	log.Print(dbConnString())
 	if err != nil {
+		log.Printf("Error parsing database connection string: %v", err)
 		return nil, err
 	}
 
@@ -72,12 +76,14 @@ func InitDBPool() (*pgxpool.Pool, error) {
 
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
+		log.Printf("Error creating database connection pool: %v", err)
 		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := pool.Ping(ctx); err != nil {
+		log.Printf("Error pinging database: %v", err)
 		return nil, err
 	}
 
