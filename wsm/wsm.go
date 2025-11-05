@@ -2,12 +2,13 @@ package wsm
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
-	"database/sql"
 	"strconv"
 	"sync"
 	"time"
@@ -18,8 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
-	"openchamp/server/portmanager"
 	"openchamp/server/config"
+	"openchamp/server/portmanager"
 )
 
 type ClientManager struct {
@@ -77,9 +78,9 @@ func (manager *ClientManager) Shutdown() {
 	close(manager.shutdown)
 	manager.mutex.Lock()
 	defer manager.mutex.Unlock()
-	
+
 	manager.queue = nil
-	
+
 	log.Println("WebSocket manager shutdown complete")
 }
 
@@ -100,12 +101,12 @@ func (client *Client) Send() chan []byte {
 }
 
 type Client struct {
-	id       string
-	conn     *websocket.Conn
-	send     chan []byte
-	manager  *ClientManager
-	dbPool   *pgxpool.Pool
-	username string
+	id            string
+	conn          *websocket.Conn
+	send          chan []byte
+	manager       *ClientManager
+	dbPool        *pgxpool.Pool
+	username      string
 	authenticated bool
 	authToken     string
 }
@@ -113,6 +114,11 @@ type Client struct {
 type Message struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+type ErrorResponse struct {
+	Message string `json:"message"`
+	Code    string `json:"code"`
 }
 
 const (
@@ -281,6 +287,27 @@ func (client *Client) processMessage(data []byte) {
 		}
 		chatMessageJSON, _ := json.Marshal(chatMessage)
 		client.manager.broadcast <- chatMessageJSON
+
+	case "private_chat":
+		var privateMsg struct {
+			Recipient string `json:"target"`
+			Message   string `json:"message"`
+		}
+
+		if err := json.Unmarshal(msg.Payload, &privateMsg); err != nil {
+			log.Printf("Error parsing private chat message: %v", err)
+			return
+		}
+
+		// Send the private message to the intended recipient
+		client.manager.mutex.RLock()
+		for recipient := range client.manager.clients {
+			if recipient.username == privateMsg.Recipient {
+				recipient.send <- []byte(fmt.Sprintf(`{"type": "private_chat", "payload": {"username": "%s", "message": "%s"}}`, client.username, privateMsg.Message))
+				break
+			}
+		}
+		client.manager.mutex.RUnlock()
 
 	// Queue Functions
 	case "join_queue":
@@ -497,11 +524,13 @@ func (client *Client) sendAuthError(message string) {
 }
 
 func (client *Client) sendRegistrationError(message string) {
+	ErrorResponse := ErrorResponse{
+		Message: message,
+		Code:    "REGISTRATION_ERROR",
+	}
 	response := map[string]interface{}{
-		"type": "register_error",
-		"payload": map[string]interface{}{
-			"message": message,
-		},
+		"type":    "error",
+		"payload": ErrorResponse,
 	}
 	responseJSON, _ := json.Marshal(response)
 	client.send <- responseJSON
@@ -570,6 +599,7 @@ func (client *Client) validateCredentials(username, password string) (bool, stri
 	return true, token, nil
 }
 
+// TODO: Move database queries to a separate data access layer
 func (client *Client) validateToken(token, clientIP string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
