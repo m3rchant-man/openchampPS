@@ -7,16 +7,23 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-	
+
 	"openchamp/server/config"
 	"openchamp/server/portmanager"
 	"openchamp/server/webapi"
 	"openchamp/server/wsm"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	print(os.Getenv("DB_USER"))
 	log.Println("Starting OpenChamp server...")
-	
+
 	/* === Database Config === */
 	DBPool, err := config.InitDBPool()
 	if err != nil {
@@ -29,7 +36,7 @@ func main() {
 
 	/* === WebSocket and Web Server Setup === */
 	portmanager.InitPortManager(config.BaseGamePort, config.MaxGamePort)
-	
+
 	WSClientManager := wsm.NewClientManager()
 	WebServer := webapi.NewServer(WSClientManager, DBPool, config.ListenAddr)
 
