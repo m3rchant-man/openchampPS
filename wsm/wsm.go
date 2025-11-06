@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -303,7 +302,15 @@ func (client *Client) processMessage(data []byte) {
 		client.manager.mutex.RLock()
 		for recipient := range client.manager.clients {
 			if recipient.username == privateMsg.Recipient {
-				recipient.send <- []byte(fmt.Sprintf(`{"type": "private_chat", "payload": {"username": "%s", "message": "%s"}}`, client.username, privateMsg.Message))
+				message := map[string]interface{}{
+					"type": "private_chat",
+					"payload": map[string]interface{}{
+						"username": client.username,
+						"message":  privateMsg.Message,
+					},
+				}
+				messageJSON, _ := json.Marshal(message)
+				recipient.send <- messageJSON
 				break
 			}
 		}
