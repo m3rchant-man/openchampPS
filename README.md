@@ -17,6 +17,7 @@ Quick start
 2. Build the server:
 ```powershell
 cd <repo-root>
+mkdir openchamp-server
 go build -o openchamp-server ./...
 ```
 3. Run the server:
